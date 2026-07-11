@@ -1,0 +1,5 @@
+.env
+.agent_memory.db
+logs/
+reports/
+generated_code/
