@@ -42,6 +42,19 @@ REPORTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reports"
 
 CODE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "generated_code")
 
+UPLOADS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "uploads")
+
+# Ekstensi file yang dianggap teks dan aman dibaca langsung sebagai konteks.
+# File di luar daftar ini (gambar, PDF, biner, dll) belum didukung.
+READABLE_TEXT_EXTENSIONS = {
+    ".txt", ".md", ".py", ".js", ".ts", ".jsx", ".tsx", ".json", ".csv",
+    ".html", ".css", ".yaml", ".yml", ".sql", ".log", ".xml", ".ini", ".cfg",
+}
+
+# Batas karakter isi file yang diikutsertakan sebagai konteks, biar tidak
+# boros token / gampang kena rate limit TPM.
+MAX_FILE_CONTEXT_CHARS = 4000
+
 # Berapa banyak pasangan (user, assistant) terakhir yang diingat per role.
 # Dibatasi supaya nggak boros token & nggak gampang kena rate limit TPM.
 MEMORY_MAX_TURNS = 10
@@ -624,6 +637,28 @@ def save_code_files(result_text: str, user_id: str = DEFAULT_USER_ID) -> list:
     return paths
 
 
+def read_file_content(filepath: str, max_chars: int = MAX_FILE_CONTEXT_CHARS) -> str:
+    """Baca isi file teks dengan aman. Return string berisi isi file (dipotong
+    kalau kepanjangan), atau pesan error yang jelas kalau file tidak bisa dibaca
+    (format tidak didukung, terlalu besar untuk dibuka, dll)."""
+    ext = os.path.splitext(filepath)[1].lower()
+    if ext not in READABLE_TEXT_EXTENSIONS:
+        return (
+            f"[Tidak bisa membaca isi file '{os.path.basename(filepath)}': "
+            f"format '{ext or '(tanpa ekstensi)'}' belum didukung. "
+            f"Format yang didukung: {', '.join(sorted(READABLE_TEXT_EXTENSIONS))}]"
+        )
+    try:
+        with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+    except Exception as e:
+        return f"[Gagal membaca file '{os.path.basename(filepath)}': {e}]"
+
+    if len(content) > max_chars:
+        content = content[:max_chars] + f"\n...[dipotong, total {len(content)} karakter]"
+    return content
+
+
 def process_message(user_message: str, user_id: str = DEFAULT_USER_ID) -> str:
     """Proses satu pesan: klasifikasi role -> dispatch -> log. Return teks hasil
     (sudah diformat) supaya bisa dipakai oleh CLI. Untuk interface yang bisa kirim
@@ -632,14 +667,30 @@ def process_message(user_message: str, user_id: str = DEFAULT_USER_ID) -> str:
     return text
 
 
-def process_message_with_files(user_message: str, user_id: str = DEFAULT_USER_ID) -> tuple:
+def process_message_with_files(
+    user_message: str,
+    user_id: str = DEFAULT_USER_ID,
+    attached_file_path: str = None,
+) -> tuple:
     """Sama seperti process_message, tapi juga mengembalikan list path file kode
     yang di-generate (kalau role-nya programmer dan hasilnya mengandung code block).
+    Kalau attached_file_path diisi, isi file itu dibaca dan disisipkan sebagai
+    konteks tambahan sebelum di-dispatch ke role yang sesuai.
     Return: (teks_hasil, list_path_file_kode)"""
-    role = classify_task(user_message)
+    effective_message = user_message
+    if attached_file_path:
+        file_content = read_file_content(attached_file_path)
+        filename = os.path.basename(attached_file_path)
+        effective_message = (
+            f"{user_message}\n\n"
+            f"[File terlampir: {filename}]\n"
+            f'"""\n{file_content}\n"""'
+        )
+
+    role = classify_task(effective_message)
     try:
-        result, model_used = dispatch(role, user_message, user_id)
-        log_interaction(role, model_used, user_message, result)
+        result, model_used = dispatch(role, effective_message, user_id)
+        log_interaction(role, model_used, effective_message, result)
 
         code_files = []
         if role == "programmer":
@@ -650,7 +701,7 @@ def process_message_with_files(user_message: str, user_id: str = DEFAULT_USER_ID
             text += "\n\nFile kode tersimpan:\n" + "\n".join(f"- {p}" for p in code_files)
         return text, code_files
     except Exception as e:
-        log_interaction(role, "N/A", user_message, "", error=str(e))
+        log_interaction(role, "N/A", effective_message, "", error=str(e))
         return f"Gagal memproses task ({role}): {e}", []
 
 
