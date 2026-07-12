@@ -80,17 +80,24 @@ ROLE_CONFIG = {
         "model": "gemini-3.5-flash",
         "fallback": ["gemini-3.1-flash-lite"],
         "system": (
-            "Kamu adalah UI/UX Designer. Jelaskan struktur layout, hierarki visual, dan rekomendasi "
-            "komponen dengan bahasa yang SEDERHANA dan mudah dibaca orang non-teknis. "
-            "Aturan format:\n"
-            "- Gunakan bullet point atau daftar bernomor, JANGAN bikin diagram ASCII/wireframe teks "
-            "yang rumit (kotak-kotak dengan garis |, +, -) kecuali user secara eksplisit minta wireframe.\n"
-            "- Untuk tiap komponen, tulis dalam format singkat: Nama komponen - Fungsinya - Kondisi/variasi "
-            "(kalau ada), tanpa istilah teknis Figma yang berlebihan.\n"
-            "- Hindari kalimat panjang bertele-tele. Langsung ke poin.\n"
-            "- Kalau perlu menjelaskan struktur halaman, pakai heading + bullet, bukan tabel ASCII."
+            "Kamu adalah UI/UX Designer.\n\n"
+            "UNTUK PERTANYAAN UMUM/STRATEGI (struktur, hierarki, rekomendasi komponen, saran): "
+            "jawab dengan bahasa SEDERHANA, bullet point atau daftar bernomor, mudah dibaca orang "
+            "non-teknis. JANGAN bikin diagram ASCII/wireframe teks yang rumit (kotak-kotak dengan "
+            "garis |, +, -). Hindari kalimat panjang bertele-tele, langsung ke poin.\n\n"
+            "UNTUK PERMINTAAN MOCKUP/VISUAL/TAMPILAN/PROTOTYPE (ada kata seperti 'mockup', 'tampilan', "
+            "'visual', 'prototype', 'contoh halaman', 'desainkan'): buat FILE HTML LENGKAP dan siap "
+            "dibuka langsung di browser, dalam SATU code block ```html ... ```, dengan ketentuan:\n"
+            "- Sertakan <!DOCTYPE html> lengkap, styling inline di dalam <style> atau pakai Tailwind "
+            "lewat <script src=\"https://cdn.tailwindcss.com\"></script>\n"
+            "- Layout, warna, tipografi, dan komponen harus benar-benar terlihat visual (bukan kotak "
+            "placeholder kosong) — buat senyata dan serapi mungkin seolah mockup produk sungguhan\n"
+            "- Pastikan responsive dasar (enak dilihat di layar HP)\n"
+            "- Beri penjelasan SINGKAT 1-2 kalimat di luar code block saja, JANGAN ulangi detail "
+            "desain dalam bentuk teks panjang — biarkan kode HTML-nya yang jadi buktinya."
         ),
         "memory_enabled": True,
+        "code_output_enabled": True,
     },
     "programmer": {
         "provider": "openrouter",
@@ -99,6 +106,7 @@ ROLE_CONFIG = {
         "system": "Kamu adalah Software Engineer. Tulis kode yang bersih, benar, dan beri penjelasan singkat.",
         "memory_enabled": True,
         "self_check_enabled": True,
+        "code_output_enabled": True,
     },
     "copywriter": {
         "provider": "openrouter",
@@ -121,6 +129,10 @@ ROUTER_MODEL = "meta-llama/llama-3.3-70b-instruct:free"
 ROUTER_FALLBACK = ["openrouter/free"]
 
 MAX_RETRIES = 3
+# Retry lebih sedikit khusus untuk percobaan dengan search grounding, karena
+# kegagalannya biasanya bukan rate limit sementara (lebih sering soal billing
+# account yang belum aktif) -> lebih cepat pindah ke fallback tanpa search.
+SEARCH_MAX_RETRIES = 1
 BACKOFF_BASE = 2  # detik
 
 
@@ -208,10 +220,20 @@ def call_with_fallback(provider: str, models: list, system: str, history: list, 
     """Coba model utama, kalau rate limit / error, coba fallback satu-satu.
     Tiap model juga di-retry dengan exponential backoff sebelum pindah ke fallback berikutnya.
     enable_search hanya berlaku untuk provider gemini (diabaikan untuk openrouter).
+
+    Kalau enable_search=True dan SEMUA percobaan dengan search gagal (misal karena
+    Google Search grounding butuh billing account yang belum aktif), sebelum pindah
+    ke model fallback berikutnya, dicoba SEKALI LAGI di model yang sama tapi TANPA
+    search — jadi analyst tetap bisa jawab (tanpa data web terkini) daripada gagal total.
+    Percobaan search-enabled dibatasi lebih sedikit retry (SEARCH_MAX_RETRIES) karena
+    kegagalan grounding biasanya bukan rate limit sementara (lebih sering soal billing
+    belum aktif), jadi retry panjang cuma buang waktu.
+
     Return: (hasil_teks, nama_model_yang_berhasil)"""
     last_error = None
     for model in models:
-        for attempt in range(MAX_RETRIES):
+        retries = SEARCH_MAX_RETRIES if (provider == "gemini" and enable_search) else MAX_RETRIES
+        for attempt in range(retries):
             try:
                 if provider == "openrouter":
                     result = call_openrouter(model, system, history)
@@ -220,13 +242,33 @@ def call_with_fallback(provider: str, models: list, system: str, history: list, 
                 return result, model
             except RateLimitError as e:
                 last_error = e
-                wait = BACKOFF_BASE ** attempt
-                print(f"  [rate limit] {model}, retry dalam {wait}s...", file=sys.stderr)
-                time.sleep(wait)
+                if attempt < retries - 1:  # jangan sleep kalau ini percobaan terakhir
+                    wait = BACKOFF_BASE ** attempt
+                    print(f"  [rate limit] {model}, retry dalam {wait}s...", file=sys.stderr)
+                    time.sleep(wait)
+                else:
+                    print(f"  [rate limit] {model}, tidak ada retry tersisa.", file=sys.stderr)
             except Exception as e:
                 last_error = e
                 print(f"  [error] {model}: {e}", file=sys.stderr)
                 break  # error non-rate-limit -> langsung coba model fallback berikutnya
+
+        # Fallback tanpa search: cuma relevan untuk gemini + enable_search=True
+        if provider == "gemini" and enable_search:
+            print(f"  [fallback] {model} gagal dengan search, coba tanpa search...", file=sys.stderr)
+            try:
+                result = call_gemini(model, system, history, enable_search=False)
+                result += (
+                    "\n\n_(Catatan: web search grounding tidak tersedia saat ini — kemungkinan "
+                    "billing account belum aktif di project AI Studio, atau kuota grounding habis. "
+                    "Jawaban di atas berdasarkan pengetahuan model, bukan pencarian web langsung.)_"
+                )
+                return result, model
+            except RateLimitError as e:
+                last_error = e
+            except Exception as e:
+                last_error = e
+
     raise RuntimeError(f"Semua model gagal untuk provider={provider}. Error terakhir: {last_error}")
 
 
@@ -693,7 +735,7 @@ def process_message_with_files(
         log_interaction(role, model_used, effective_message, result)
 
         code_files = []
-        if role == "programmer":
+        if ROLE_CONFIG[role].get("code_output_enabled"):
             code_files = save_code_files(result, user_id)
 
         text = f"[{role} | {model_used}]\n{result}"
